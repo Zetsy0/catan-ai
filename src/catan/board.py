@@ -41,10 +41,6 @@ def cartesian_to_axial(x,y) :
     return x/2 - y/6, y/3
 
 def get_vertices(hexagon: Hex) -> set[Vertex]:
-    CORNER_OFFSETS = [
-        (1, 1), (0, 2), (-1, 1),
-        (-1, -1), (0, -2), (1, -1)
-    ]
     x,y = axial_to_cartesian(hexagon.q,hexagon.r)
     vertices = set()
     for dx,dy in CORNER_OFFSETS :
@@ -60,10 +56,6 @@ def generate_vertices(hexes: set[Hex]) -> set[Vertex]:
 Edge = frozenset[Vertex]
 
 def get_edges(hexagon: Hex) -> set[Edge]:
-    CORNER_OFFSETS = [
-        (1, 1), (0, 2), (-1, 1),
-        (-1, -1), (0, -2), (1, -1)
-    ]
     edges = set()
     vertex_list = []
     x,y = axial_to_cartesian(hexagon.q, hexagon.r)
