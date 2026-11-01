@@ -90,14 +90,33 @@ def generate_vertex_hex_adjacency(vertices: set[Vertex], hexes: set[Hex])\
     return vertex_hex_adjacency_dict
 
 class Board:
-    def __init__(self, radius: int = 2):
-        self.radius = radius
-        self.hexes = generate_hexes(radius)
-        self.vertices = generate_vertices(self.hexes)
+    def __init__(self, seed: int | None = None):
+        rng = random.Random(seed)
 
+        # 1. Geometry
+        self.hexes = generate_hexes(2)
+        self.vertices = generate_vertices(self.hexes)
         self.edges = generate_edges(self.hexes)
-        self.vertex_adjacency = generate_vertex_adjacency(self.vertices, self.edges)
-        self.vertex_hex_adjacency = generate_vertex_hex_adjacency(self.vertices, self.hexes)
+
+        # 2. Adjacency
+        self.vertex_adjacency = generate_vertex_adjacency(
+            self.vertices, self.edges
+        )
+        self.vertex_hex_adjacency = generate_vertex_hex_adjacency(
+            self.vertices, self.hexes
+        )
+
+        # 3. Resources and dice numbers
+        self.hex_resources = generate_terrain(self.hexes, rng)
+        self.hex_numbers = generate_numbers(
+            self.hexes, self.hex_resources, rng
+        )
+
+        # 4. Ports
+        coastal_edges = get_coastal_edges(self.hexes)
+        ordered_edges = order_coastal_edges(coastal_edges)
+        port_edges = generate_ports_location(ordered_edges, rng)
+        self.ports = assign_port_types(port_edges, rng)
 
 
 
@@ -253,15 +272,32 @@ def plot_board(hexes, resources, numbers, ports):
 
 if __name__ == "__main__":
     
-    rng = random.Random(42)
+    
+    board = Board(seed=42)
 
-    hexes = generate_hexes(2)
-    resources = generate_terrain(hexes, rng)
-    numbers = generate_numbers(hexes, resources, rng)
+    # Geometry
+    assert len(board.hexes) == 19
+    assert len(board.vertices) == 54
+    assert len(board.edges) == 72
 
-    coastal_edges = get_coastal_edges(hexes)
-    ordered_edges = order_coastal_edges(coastal_edges)
-    port_edges = generate_ports_location(ordered_edges, rng)
-    ports = assign_port_types(port_edges, rng)
+    # Random configuration
+    assert len(board.hex_resources) == 19
+    assert len(board.hex_numbers) == 19
+    assert len(board.ports) == 9
 
-    plot_board(hexes, resources, numbers, ports)
+    # Number constraints
+    assert is_valid_number_placement(
+        board.hex_numbers, board.hexes
+    )
+
+    # Reproducibility
+    board2 = Board(seed=42)
+
+    assert board.hex_resources == board2.hex_resources
+    assert board.hex_numbers == board2.hex_numbers
+    assert board.ports == board2.ports
+
+    print("Board tests passed!")
+
+
+    plot_board(board.hexes, board.hex_resources, board.hex_numbers, board.ports)
