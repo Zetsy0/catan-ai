@@ -5,7 +5,7 @@ from matplotlib.patches import Polygon
 from .board import Board, Vertex, CORNER_OFFSETS, axial_to_cartesian
 
 
-def plot_board(board: Board, filename: str = "board.png") -> None:
+def plot_board( board: Board, show: bool = True, save: bool = False, filename: str = "board.png") -> None:
     colors = {
         "wood": "#36854b",
         "brick": "#bc6250",
@@ -22,18 +22,15 @@ def plot_board(board: Board, filename: str = "board.png") -> None:
 
     # Draw hexagons
     for hexagon in board.hexes:
-        vertices = [
-            Vertex(
-                axial_to_cartesian(hexagon.q, hexagon.r)[0] + dx,
-                axial_to_cartesian(hexagon.q, hexagon.r)[1] + dy
-            )
-            for dx, dy in CORNER_OFFSETS
-        ]
+        x, y = axial_to_cartesian(hexagon.q, hexagon.r)
 
-        corners = [plot_coords(v) for v in board.vertices]
+        vertices = [Vertex(x + dx, y + dy) for dx, dy in CORNER_OFFSETS]
+
+        corners = [plot_coords(v) for v in vertices]
+
         ax.add_patch(Polygon(
             corners,
-            facecolor=colors[resources[hexagon]],
+            facecolor=colors[board.hex_resources[hexagon]],
             edgecolor="black"
         ))
 
@@ -72,4 +69,14 @@ def plot_board(board: Board, filename: str = "board.png") -> None:
     ax.autoscale_view()
     ax.margins(0.25)
     ax.axis("off")
-    plt.show()
+    if save:
+        fig.savefig(filename, dpi=150, bbox_inches="tight")
+
+    if show:
+        plt.show()
+
+    plt.close(fig)
+
+if __name__ == "__main__":
+    board = Board(seed=42)
+    plot_board(board)
