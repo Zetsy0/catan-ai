@@ -47,6 +47,11 @@ class GameState:
     phase: str = "setup_settlement"
     robber_return_phase: str | None = None # The phase which we will return to after the robber has moved
 
+    road_building_return_phase: str | None = None
+    free_roads_remaining: int = 0
+
+    winner_id: int | None = None
+
     def __post_init__(self):
         self.robber_hex = next(h for h, resource in self.board.hex_resources.items() if resource is None)
         self.development_card_deck = ["knight"] * 14 + ["victory_point"] * 5 + \

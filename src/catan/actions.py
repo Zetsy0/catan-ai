@@ -1,7 +1,7 @@
 from .board import Vertex, Edge, Hex, get_vertices
 from .game import GameState, PlayerState, SETUP_ORDER
 from .rules import (can_place_initial_settlement, can_place_initial_road, can_move_robber, can_place_road, can_place_settlement,
-                    can_place_city, get_trade_ratio,
+                    can_place_city, get_trade_ratio, longest_road_length,
 )
 from collections import Counter
 
@@ -12,6 +12,8 @@ SETTLEMENT_COST = {"wood": 1, "brick": 1, "sheep": 1, "wheat": 1}
 CITY_COST = {"ore": 3, "wheat": 2}
 
 DEV_CARD_COST = {"ore": 1, "wheat": 1, "sheep": 1}
+
+WINNING_POINTS = 15
 
 def place_initial_settlement(
     state: GameState,
@@ -85,22 +87,58 @@ def roll_dice(state: GameState) -> int:
     return roll
 
 
+
 def produce_resources(state: GameState, roll: int) -> None:
-    producing_hexes = [
-        h for h, number in state.board.hex_numbers.items()
-        if number == roll and h != state.robber_hex
-    ]
-    for hexagon in producing_hexes:
+    # Step 1: Calculate total demand for each resource and player
+    demands = {
+        resource: {player_id: 0 for player_id in state.players}
+        for resource in state.bank
+    }
+
+    for hexagon, number in state.board.hex_numbers.items():
+        if number != roll or hexagon == state.robber_hex:
+            continue
+
         resource = state.board.hex_resources[hexagon]
         if resource is None:
             continue
+
         for vertex in get_vertices(hexagon):
-            for player in state.players.values() :
-                if vertex in player.settlements :
-                    give_resources(state, player, resource, 1)
-                elif vertex in player.cities :
-                    give_resources(state, player, resource, 2)
-    return None
+            for player_id, player in state.players.items():
+                if vertex in player.settlements:
+                    demands[resource][player_id] += 1
+                elif vertex in player.cities:
+                    demands[resource][player_id] += 2
+
+    # Step 2: Distribute resources according to bank availability
+    for resource, requests in demands.items():
+        claimants = {
+            player_id: quantity
+            for player_id, quantity in requests.items()
+            if quantity > 0
+        }
+
+        if not claimants:
+            continue
+
+        total_requested = sum(claimants.values())
+        available = state.bank[resource]
+
+        # Multiple claimants and insufficient stock:
+        # nobody receives this resource
+        if len(claimants) > 1 and available < total_requested:
+            continue
+
+        # Otherwise, distribute resources.
+        # give_resources handles shortages for a single claimant.
+        for player_id, quantity in claimants.items():
+            give_resources(
+                state,
+                state.players[player_id],
+                resource,
+                quantity
+            )
+
 
 def give_resources(state: GameState, player: PlayerState, resource: str, quantity: int) -> None:
     given = min(quantity, state.bank[resource])
@@ -126,8 +164,6 @@ def discard_resources(
     if not all(state.players[player_id].resources[resource] >= cards[resource] for resource in cards) :
         raise ValueError("Not enough cards for the given discard choice")
 
-    
-    
     for resource in cards :
         state.players[player_id].resources[resource] -= cards[resource]
         state.bank[resource] += cards[resource]
@@ -185,6 +221,9 @@ def build_road(
         raise ValueError("Player cannot afford the cost or the cost is faulty")
 
     player.roads.add(edge)
+    update_longest_road(state)
+    check_victory(state)
+
     return None
 
 def build_settlement(
@@ -204,7 +243,9 @@ def build_settlement(
         raise ValueError("Player cannot afford the cost or the cost is faulty")
 
     player.settlements.add(vertex)
-    
+    update_longest_road(state)
+    check_victory(state)
+
     return None
 
 def build_city(
@@ -225,7 +266,7 @@ def build_city(
 
     player.settlements.remove(vertex)
     player.cities.add(vertex)
-
+    check_victory(state)
     
     return None
 
@@ -291,6 +332,7 @@ def buy_development_card(state: GameState) -> None:
         raise ValueError("Payement unsuccesful")
 
     state.players[state.current_player_id].new_development_cards.append(state.development_card_deck.pop())
+    check_victory(state)
     
     return None
 
@@ -331,6 +373,11 @@ def play_knight(state: GameState) -> None:
     player.played_dev_card_this_turn = True
 
     update_largest_army(state)
+    check_victory(state)
+
+    if state.phase == "game_over" :
+        state.robber_return_phase = None
+        return 
 
     state.robber_return_phase = state.phase
     state.phase = "move_robber"
@@ -351,7 +398,171 @@ def update_largest_army(state: GameState) -> None :
     return None
 
 def play_monopoly(state: GameState, resource: str) -> None:
-    ...
+    if state.phase not in ["main_turn","roll_dice"] :
+        raise ValueError("Attempting to use monopoly outside of 'main_turn' or 'roll_dice' phases")
+    
+    if resource not in state.bank:
+        raise ValueError("Invalid resource type")
+    
+    player_id = state.current_player_id
+    player = state.players[player_id]
+    opponent = state.players[1 - player_id]
+
+    if "monopoly" not in player.development_cards :
+        raise ValueError("Attempting to play 'monopoly' without a 'monopoly' card in hand")
+        
+    if player.played_dev_card_this_turn :
+        raise ValueError("Player has already played a development card this turn")
+
+    player.resources[resource]  += opponent.resources[resource]
+    opponent.resources[resource] = 0 
+
+    player.played_dev_card_this_turn = True
+    player.development_cards.remove("monopoly")
+
+    return None
+
+def play_year_of_plenty(state: GameState, resource_1: str, resource_2: str) -> None:
+    if state.phase not in ["main_turn","roll_dice"] :
+        raise ValueError("Attempting to use monopoly outside of 'main_turn' or 'roll_dice' phases")
+    
+    if resource_1 not in state.bank or resource_2 not in state.bank :
+        raise ValueError("Invalid resource type")
+
+    player_id = state.current_player_id
+    player = state.players[player_id]
+
+    if not "year_of_plenty" in player.development_cards :
+        raise ValueError("Attempting to play 'year_of_plenty' without a 'year_of_plenty' card in hand")
+
+    if player.played_dev_card_this_turn :
+            raise ValueError("Player has already played a development card this turn")
+
+    if resource_2 == resource_1 :
+        if state.bank[resource_1] < 2 :
+            raise ValueError("Not enough resources in the bank for these resources")
+    else :
+        if state.bank[resource_1] == 0 or state.bank[resource_2] == 0:
+            raise ValueError("Not enough resources in the bank for these resources")
+
+    player.resources[resource_1] += 1
+    player.resources[resource_2] += 1
+    state.bank[resource_1] -= 1
+    state.bank[resource_2] -= 1
+
+    player.development_cards.remove("year_of_plenty")
+    player.played_dev_card_this_turn = True
+
+    return None
+
+
+def play_road_building(state: GameState) -> None:
+    if state.phase not in ("roll_dice", "main_turn"):
+        raise ValueError("Wrong phase for Road Building")
+
+    player_id = state.current_player_id
+    player = state.players[player_id]
+
+    if "road_building" not in player.development_cards:
+        raise ValueError("Player has no Road Building card")
+
+    if player.played_dev_card_this_turn:
+        raise ValueError("Already played a development card this turn")
+
+    # Check that at least one road can be placed
+    if not any(
+        can_place_road(state, edge, player_id)
+        for edge in state.board.edges
+    ):
+        raise ValueError("No legal road placements available")
+
+    # Consume the development card
+    player.development_cards.remove("road_building")
+    player.played_dev_card_this_turn = True
+
+    # Save the previous phase
+    state.road_building_return_phase = state.phase
+    state.free_roads_remaining = 2
+    state.phase = "road_building"
+
+
+def place_free_road(state: GameState, edge: Edge) -> None:
+    if state.phase != "road_building":
+        raise ValueError("Wrong phase for free road placement")
+
+    if state.free_roads_remaining <= 0:
+        raise ValueError("No free roads remaining")
+
+    return_phase = state.road_building_return_phase
+
+    if return_phase is None:
+        raise RuntimeError("Missing road building return phase")
+
+    player_id = state.current_player_id
+    player = state.players[player_id]
+
+    if not can_place_road(state, edge, player_id):
+        raise ValueError("Invalid road placement")
+
+    # Place the road without paying
+    player.roads.add(edge)
+    update_longest_road(state)
+    check_victory(state)
+    state.free_roads_remaining -= 1
+    if state.phase == "game_over":
+        state.free_roads_remaining = 0
+        state.road_building_return_phase = None
+        return
+
+    # Check whether another legal road can be placed
+    has_legal_road = any(
+        can_place_road(state, e, player_id)
+        for e in state.board.edges
+    )
+
+    # Finish if two roads were placed, or none remain possible
+    if state.free_roads_remaining == 0 or not has_legal_road:
+        state.free_roads_remaining = 0
+        state.phase = return_phase
+        state.road_building_return_phase = None
+
+
+def update_longest_road(state: GameState) -> None:
+    lengths = {
+        player_id: longest_road_length(state, player_id)
+        for player_id in state.players
+    }
+
+    max_length = max(lengths.values())
+
+    # No player qualifies
+    if max_length < 5:
+        state.longest_road_holder = None
+        return
+
+    # Players tied for the longest road
+    leaders = [
+        player_id
+        for player_id, length in lengths.items()
+        if length == max_length
+    ]
+
+    # Current holder retains the award in case of a tie
+    if state.longest_road_holder in leaders:
+        return
+
+    # Unique leader receives the award; otherwise nobody does
+    state.longest_road_holder = (
+        leaders[0] if len(leaders) == 1 else None
+    )
+
+def check_victory(state: GameState) -> None:
+    player_id = state.current_player_id
+
+    if state.total_victory_points(player_id) >= WINNING_POINTS :
+        state.winner_id = player_id
+        state.phase = "game_over"
+
 
     
 

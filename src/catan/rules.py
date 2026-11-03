@@ -140,3 +140,60 @@ def get_trade_ratio(
 
     return ratio
 
+
+def longest_road_length(state: GameState, player_id: int) -> int:
+    player = state.players[player_id]
+
+    if not player.roads:
+        return 0
+
+    # 1. Build adjacency dictionary for the player's roads
+    road_adjacency: dict[Vertex, set[Edge]] = {}
+
+    for edge in player.roads:
+        for vertex in edge:
+            road_adjacency.setdefault(vertex, set()).add(edge)
+
+    # 2. Identify vertices blocked by opponents
+    blocked_vertices = set()
+
+    for opponent_id, opponent in state.players.items():
+        if opponent_id != player_id:
+            blocked_vertices.update(opponent.settlements)
+            blocked_vertices.update(opponent.cities)
+
+    # 3. Depth-First Search
+    def dfs(vertex: Vertex, used_edges: set[Edge]) -> int:
+
+        # An opponent's building prevents continuing a road
+        if vertex in blocked_vertices and used_edges:
+            return 0
+
+        longest = 0
+
+        for edge in road_adjacency.get(vertex, set()):
+
+            # Cannot use the same road twice
+            if edge in used_edges:
+                continue
+
+            # Find the other endpoint of this edge
+            next_vertex = next(iter(edge - {vertex}))
+
+            # Explore this road
+            used_edges.add(edge)
+
+            length = 1 + dfs(next_vertex, used_edges)
+            longest = max(longest, length)
+
+            # Backtrack to explore other possibilities
+            used_edges.remove(edge)
+
+        return longest
+
+    # 4. Try every possible starting vertex
+    return max(
+        dfs(vertex, set())
+        for vertex in road_adjacency
+    )
+

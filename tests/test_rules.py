@@ -1,7 +1,7 @@
 
 import pytest
 
-from catan.board import Board, Vertex, get_vertices
+from catan.board import Board, Vertex, Hex, get_vertices
 from catan.game import GameState
 from catan.rules import (
     can_place_initial_settlement,
@@ -12,7 +12,9 @@ from catan.rules import (
     can_place_settlement,
     can_place_city,
     get_trade_ratio,
+    longest_road_length
 )
+
 
 @pytest.fixture
 def game():
@@ -371,3 +373,107 @@ def test_trade_ratio_multiple_ports(game):
 
     # Other resources benefit from the generic port
     assert get_trade_ratio(game, 0, "brick") == 3
+
+@pytest.fixture
+def road_chain(game):
+    """Create a chain of three connected roads."""
+    vertices = [
+        Vertex(1, 1),
+        Vertex(0, 2),
+        Vertex(-1, 1),
+        Vertex(-1, -1),
+    ]
+
+    edges = [
+        frozenset({a, b})
+        for a, b in zip(vertices, vertices[1:])
+    ]
+
+    assert all(edge in game.board.edges for edge in edges)
+
+    game.players[0].roads.update(edges)
+
+    return game, vertices
+
+
+def test_longest_road_empty(game):
+    assert longest_road_length(game, 0) == 0
+
+
+def test_longest_road_straight(road_chain):
+    game, vertices = road_chain
+
+    assert longest_road_length(game, 0) == 3
+    assert longest_road_length(game, 1) == 0
+
+
+def test_longest_road_branch(game):
+    # Find a vertex with three neighbors
+    center = next(
+        v for v, neighbors in game.board.vertex_adjacency.items()
+        if len(neighbors) == 3
+    )
+
+    # Create three branches from the same vertex
+    for neighbor in game.board.vertex_adjacency[center]:
+        game.players[0].roads.add(
+            frozenset({center, neighbor})
+        )
+
+    # Three roads exist, but the longest route uses only two
+    assert len(game.players[0].roads) == 3
+    assert longest_road_length(game, 0) == 2
+
+
+def test_longest_road_loop(game):
+    # Build all six roads around the central hexagon
+    vertices = get_vertices(Hex(0, 0))
+
+    edges = {
+        edge for edge in game.board.edges
+        if edge.issubset(vertices)
+    }
+
+    assert len(edges) == 6
+
+    game.players[0].roads.update(edges)
+
+    # A complete loop counts all six roads
+    assert longest_road_length(game, 0) == 6
+
+
+@pytest.mark.parametrize("building", ["settlements", "cities"])
+def test_longest_road_blocked_by_opponent(road_chain, building):
+    game, vertices = road_chain
+
+    # Opponent builds at an intermediate vertex
+    blocked_vertex = vertices[1]
+    getattr(game.players[1], building).add(blocked_vertex)
+
+    # The original chain of 3 is split into lengths 1 and 2
+    assert longest_road_length(game, 0) == 2
+
+
+def test_longest_road_own_settlement_does_not_block(road_chain):
+    game, vertices = road_chain
+
+    game.players[0].settlements.add(vertices[1])
+
+    # The player's own settlement doesn't interrupt the route
+    assert longest_road_length(game, 0) == 3
+
+
+def test_longest_road_disconnected(road_chain):
+    game, vertices = road_chain
+
+    # Add an isolated road elsewhere
+    disconnected_edge = next(
+        edge for edge in game.board.edges
+        if edge.isdisjoint(vertices)
+    )
+
+    game.players[0].roads.add(disconnected_edge)
+
+    # Four roads total, but longest connected route is three
+    assert len(game.players[0].roads) == 4
+    assert longest_road_length(game, 0) == 3

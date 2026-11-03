@@ -4,10 +4,13 @@ from collections import Counter
 
 from catan.board import Board, Vertex, get_vertices
 from catan.game import GameState, SETUP_ORDER
-from catan.rules import can_place_initial_settlement, can_place_initial_road, can_move_robber, get_trade_ratio
+from catan.rules import (can_place_initial_settlement, can_place_initial_road, can_move_robber, get_trade_ratio, can_place_road,
+                        longest_road_length,
+)
 from catan.actions import (place_initial_settlement, place_initial_road, roll_dice, discard_resources, move_robber, build_road,
                            build_settlement, pay_resources, build_city, trade_with_bank, buy_development_card, end_turn, play_knight,
-                           update_largest_army
+                           update_largest_army, play_monopoly, play_year_of_plenty, play_road_building, place_free_road, check_victory,
+                           produce_resources,
 )
 
 @pytest.fixture
@@ -217,6 +220,98 @@ def test_dice_resource_integration(game, monkeypatch):
     assert resource is not None
     assert game.players[0].resources[resource] == 1
     assert game.bank[resource] == 18
+
+@pytest.fixture
+def production_state():
+    state = GameState(board=Board(seed=42), seed=123)
+
+    # Isolate a single wood-producing hexagon
+    hexagon = next(
+        h for h in state.board.hexes
+        if h != state.robber_hex
+    )
+
+    for h in state.board.hex_numbers:
+        state.board.hex_numbers[h] = None
+
+    state.board.hex_numbers[hexagon] = 6
+    state.board.hex_resources[hexagon] = "wood"
+
+    vertices = get_vertices(hexagon)
+    v0 = next(iter(vertices))
+    v1 = next(
+        v for v in vertices
+        if v != v0
+        and v not in state.board.vertex_adjacency[v0]
+    )
+
+    # Player 0 demands 2 wood; player 1 demands 1
+    state.players[0].cities.add(v0)
+    state.players[1].settlements.add(v1)
+
+    return state, hexagon
+
+
+@pytest.mark.parametrize(
+    "bank_stock, two_claimants, expected",
+    [
+        (10, True, (2, 1, 7)),  # Enough resources
+        (3, True, (2, 1, 0)),   # Exactly enough
+        (2, True, (0, 0, 2)),   # Shortage: nobody receives
+        (1, False, (1, 0, 0)),  # One claimant: partial payment
+    ]
+)
+def test_resource_production_bank_shortages(
+    production_state,
+    bank_stock,
+    two_claimants,
+    expected
+):
+    state, _ = production_state
+
+    if not two_claimants:
+        state.players[1].settlements.clear()
+
+    state.bank["wood"] = bank_stock
+
+    produce_resources(state, 6)
+
+    p0, p1, bank = expected
+
+    assert state.players[0].resources["wood"] == p0
+    assert state.players[1].resources["wood"] == p1
+    assert state.bank["wood"] == bank
+
+
+def test_shortage_does_not_block_other_resources(production_state):
+    state, wood_hex = production_state
+
+    # Find a separate hexagon producing brick on the same roll
+    brick_hex = next(
+        h for h in state.board.hexes
+        if h != state.robber_hex
+        and get_vertices(h).isdisjoint(get_vertices(wood_hex))
+    )
+
+    state.board.hex_numbers[brick_hex] = 6
+    state.board.hex_resources[brick_hex] = "brick"
+
+    brick_vertex = next(iter(get_vertices(brick_hex)))
+    state.players[0].settlements.add(brick_vertex)
+
+    state.bank["wood"] = 2   # Insufficient for both players
+    state.bank["brick"] = 1  # Enough for brick production
+
+    produce_resources(state, 6)
+
+    # Wood production is cancelled
+    assert state.players[0].resources["wood"] == 0
+    assert state.players[1].resources["wood"] == 0
+    assert state.bank["wood"] == 2
+
+    # Brick production proceeds normally
+    assert state.players[0].resources["brick"] == 1
+    assert state.bank["brick"] == 0
 
 
 def test_discard_resources(game):
@@ -1187,18 +1282,788 @@ def test_largest_army_integration_with_knight(game):
     assert game.visible_victory_points(0) == 2
     assert game.phase == "move_robber"
 
+@pytest.mark.parametrize("phase", ["roll_dice", "main_turn"])
+def test_play_monopoly_success(game, phase):
+    game.phase = phase
 
-    
+    player = game.players[0]
+    opponent = game.players[1]
 
-    
+    player.development_cards = ["monopoly"]
+    player.resources["wood"] = 2
+    opponent.resources["wood"] = 4
+    opponent.resources["brick"] = 1
+
+    game.bank["wood"] -= 6
+    game.bank["brick"] -= 1
+    original_bank = game.bank.copy()
+
+    play_monopoly(game, "wood")
+
+    # All wood transfers to player 0
+    assert player.resources["wood"] == 6
+    assert opponent.resources["wood"] == 0
+
+    # Other resources and bank remain unchanged
+    assert opponent.resources["brick"] == 1
+    assert game.bank == original_bank
+
+    # Development card is consumed
+    assert player.development_cards == []
+    assert player.played_dev_card_this_turn is True
+
+    # Phase doesn't change
+    assert game.phase == phase
 
 
+def test_play_monopoly_empty_opponent(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["monopoly"]
+
+    # Opponent has no wood
+    assert game.players[1].resources["wood"] == 0
+
+    play_monopoly(game, "wood")
+
+    assert player.resources["wood"] == 0
+    assert player.development_cards == []
+    assert player.played_dev_card_this_turn is True
+    assert game.phase == "main_turn"
 
 
+@pytest.mark.parametrize("new_cards", [[], ["monopoly"]])
+def test_play_monopoly_without_playable_card(game, new_cards):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    player.new_development_cards = new_cards.copy()
+    game.players[1].resources["wood"] = 3
+
+    with pytest.raises(ValueError):
+        play_monopoly(game, "wood")
+
+    assert game.players[1].resources["wood"] == 3
+    assert player.resources["wood"] == 0
+    assert player.new_development_cards == new_cards
+    assert player.played_dev_card_this_turn is False
+    assert game.phase == "main_turn"
 
 
+def test_cannot_play_two_monopolies(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    player.development_cards = ["monopoly", "monopoly"]
+    game.players[1].resources["wood"] = 4
+
+    # First Monopoly succeeds
+    play_monopoly(game, "wood")
+
+    assert player.resources["wood"] == 4
+    assert player.development_cards == ["monopoly"]
+
+    # Second Monopoly must fail
+    with pytest.raises(ValueError):
+        play_monopoly(game, "wood")
+
+    assert player.development_cards == ["monopoly"]
+    assert player.played_dev_card_this_turn is True
+    assert game.phase == "main_turn"
 
 
+@pytest.mark.parametrize(
+    "phase",
+    ["setup_settlement", "discard", "move_robber"]
+)
+def test_play_monopoly_wrong_phase(game, phase):
+    game.phase = phase
+    player = game.players[0]
+    player.development_cards = ["monopoly"]
+
+    with pytest.raises(ValueError):
+        play_monopoly(game, "wood")
+
+    assert player.development_cards == ["monopoly"]
+    assert player.played_dev_card_this_turn is False
+    assert game.phase == phase
 
 
+def test_play_monopoly_invalid_resource(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["monopoly"]
+
+    with pytest.raises(ValueError):
+        play_monopoly(game, "gold")
+
+    assert player.development_cards == ["monopoly"]
+    assert player.played_dev_card_this_turn is False
+
+
+def test_play_monopoly_player_one(game):
+    game.phase = "main_turn"
+    game.current_player_id = 1
+
+    game.players[1].development_cards = ["monopoly"]
+    game.players[0].resources["ore"] = 5
+
+    play_monopoly(game, "ore")
+
+    assert game.players[0].resources["ore"] == 0
+    assert game.players[1].resources["ore"] == 5
+    assert game.players[1].development_cards == []
+
+@pytest.mark.parametrize("phase", ["roll_dice", "main_turn"])
+@pytest.mark.parametrize(
+    "resources",
+    [
+        ("wood", "brick"),
+        ("wood", "wood"),
+    ]
+)
+def test_year_of_plenty_success(game, phase, resources):
+    game.phase = phase
+    player = game.players[0]
+    player.development_cards = ["year_of_plenty"]
+
+    initial_bank = game.bank.copy()
+    requested = Counter(resources)
+
+    play_year_of_plenty(game, *resources)
+
+    # Check resource transfers
+    for resource in game.bank:
+        assert player.resources[resource] == requested[resource]
+        assert game.bank[resource] == (
+            initial_bank[resource] - requested[resource]
+        )
+
+    # Development card consumed
+    assert player.development_cards == []
+    assert player.played_dev_card_this_turn is True
+
+    # Phase remains unchanged
+    assert game.phase == phase
+
+
+@pytest.mark.parametrize(
+    "resources, bank_stock",
+    [
+        (("wood", "wood"), {"wood": 1}),
+        (("wood", "brick"), {"wood": 0}),
+        (("wood", "brick"), {"brick": 0}),
+    ]
+)
+def test_year_of_plenty_bank_shortage(
+    game, resources, bank_stock
+):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["year_of_plenty"]
+
+    game.bank.update(bank_stock)
+
+    original_bank = game.bank.copy()
+    original_resources = player.resources.copy()
+
+    with pytest.raises(ValueError):
+        play_year_of_plenty(game, *resources)
+
+    # Failed action leaves state unchanged
+    assert game.bank == original_bank
+    assert player.resources == original_resources
+    assert player.development_cards == ["year_of_plenty"]
+    assert player.played_dev_card_this_turn is False
+    assert game.phase == "main_turn"
+
+
+@pytest.mark.parametrize(
+    "cards, new_cards, already_played",
+    [
+        ([], [], False),
+        ([], ["year_of_plenty"], False),
+        (["year_of_plenty"], [], True),
+    ]
+)
+def test_year_of_plenty_unavailable(
+    game, cards, new_cards, already_played
+):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    player.development_cards = cards.copy()
+    player.new_development_cards = new_cards.copy()
+    player.played_dev_card_this_turn = already_played
+
+    original_bank = game.bank.copy()
+    original_resources = player.resources.copy()
+
+    with pytest.raises(ValueError):
+        play_year_of_plenty(game, "wood", "brick")
+
+    assert game.bank == original_bank
+    assert player.resources == original_resources
+    assert player.development_cards == cards
+    assert player.new_development_cards == new_cards
+    assert player.played_dev_card_this_turn == already_played
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["setup_settlement", "discard", "move_robber"]
+)
+def test_year_of_plenty_wrong_phase(game, phase):
+    game.phase = phase
+    player = game.players[0]
+    player.development_cards = ["year_of_plenty"]
+
+    with pytest.raises(ValueError):
+        play_year_of_plenty(game, "wood", "brick")
+
+    assert player.development_cards == ["year_of_plenty"]
+    assert player.played_dev_card_this_turn is False
+    assert game.phase == phase
+
+
+@pytest.mark.parametrize(
+    "resources",
+    [
+        ("gold", "wood"),
+        ("wood", "gold"),
+    ]
+)
+def test_year_of_plenty_invalid_resource(game, resources):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["year_of_plenty"]
+
+    original_bank = game.bank.copy()
+
+    with pytest.raises(ValueError):
+        play_year_of_plenty(game, *resources)
+
+    assert game.bank == original_bank
+    assert player.development_cards == ["year_of_plenty"]
+    assert player.played_dev_card_this_turn is False
+
+@pytest.fixture
+def road_building_setup(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["road_building"]
+
+    # Select two connected edges: a--b--c
+    first_edge = next(iter(game.board.edges))
+    a, b = tuple(first_edge)
+
+    c = next(
+        v for v in game.board.vertex_adjacency[b]
+        if v != a
+    )
+    second_edge = frozenset({b, c})
+
+    # The first road connects to the player's settlement
+    player.settlements.add(a)
+
+    assert can_place_road(game, first_edge, 0)
+    assert not can_place_road(game, second_edge, 0)
+
+    return game, first_edge, second_edge
+
+
+@pytest.mark.parametrize("phase", ["roll_dice", "main_turn"])
+def test_road_building_two_roads(road_building_setup, phase):
+    game, first_edge, second_edge = road_building_setup
+    game.phase = phase
+    player = game.players[0]
+
+    original_resources = player.resources.copy()
+    original_bank = game.bank.copy()
+
+    play_road_building(game)
+
+    assert player.development_cards == []
+    assert player.played_dev_card_this_turn is True
+    assert game.phase == "road_building"
+    assert game.road_building_return_phase == phase
+    assert game.free_roads_remaining == 2
+
+    # Place first road
+    place_free_road(game, first_edge)
+
+    assert first_edge in player.roads
+    assert game.free_roads_remaining == 1
+    assert game.phase == "road_building"
+
+    # The second road can now connect to the first
+    assert can_place_road(game, second_edge, 0)
+
+    place_free_road(game, second_edge)
+
+    assert player.roads == {first_edge, second_edge}
+    assert game.free_roads_remaining == 0
+    assert game.phase == phase
+    assert game.road_building_return_phase is None
+
+    # Neither road should cost resources
+    assert player.resources == original_resources
+    assert game.bank == original_bank
+
+
+def test_road_building_one_piece_remaining(road_building_setup):
+    game, first_edge, _ = road_building_setup
+    player = game.players[0]
+
+    # Give the player 14 roads, excluding the intended edge
+    other_edges = [
+        e for e in game.board.edges
+        if e != first_edge
+    ]
+    player.roads.update(other_edges[:14])
+
+    assert player.remaining_roads == 1
+    assert can_place_road(game, first_edge, 0)
+
+    play_road_building(game)
+    place_free_road(game, first_edge)
+
+    # No road pieces remain, so the card finishes early
+    assert player.remaining_roads == 0
+    assert game.free_roads_remaining == 0
+    assert game.phase == "main_turn"
+    assert game.road_building_return_phase is None
+
+
+def test_road_building_invalid_placement(road_building_setup):
+    game, first_edge, _ = road_building_setup
+    player = game.players[0]
+
+    play_road_building(game)
+
+    # Select an edge disconnected from the settlement
+    invalid_edge = next(
+        e for e in game.board.edges
+        if e.isdisjoint(first_edge)
+    )
+
+    with pytest.raises(ValueError):
+        place_free_road(game, invalid_edge)
+
+    # Failed placement does not modify the state
+    assert player.roads == set()
+    assert game.free_roads_remaining == 2
+    assert game.phase == "road_building"
+    assert game.road_building_return_phase == "main_turn"
+
+
+def test_road_building_no_legal_roads(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+    player.development_cards = ["road_building"]
+
+    # No settlements or roads: no legal placements
+    with pytest.raises(ValueError):
+        play_road_building(game)
+
+    assert player.development_cards == ["road_building"]
+    assert player.played_dev_card_this_turn is False
+    assert game.free_roads_remaining == 0
+    assert game.phase == "main_turn"
+
+
+@pytest.mark.parametrize(
+    "cards, new_cards, already_played",
+    [
+        ([], ["road_building"], False),
+        ([], [], False),
+        (["road_building"], [], True),
+    ]
+)
+def test_road_building_unavailable(
+    road_building_setup, cards, new_cards, already_played
+):
+    game, _, _ = road_building_setup
+    player = game.players[0]
+
+    player.development_cards = cards.copy()
+    player.new_development_cards = new_cards.copy()
+    player.played_dev_card_this_turn = already_played
+
+    with pytest.raises(ValueError):
+        play_road_building(game)
+
+    assert player.development_cards == cards
+    assert player.new_development_cards == new_cards
+    assert player.played_dev_card_this_turn == already_played
+    assert game.phase == "main_turn"
+    assert game.free_roads_remaining == 0
+
+
+@pytest.mark.parametrize(
+    "phase",
+    ["setup_settlement", "discard", "move_robber"]
+)
+def test_road_building_wrong_phase(road_building_setup, phase):
+    game, _, _ = road_building_setup
+    player = game.players[0]
+    game.phase = phase
+
+    with pytest.raises(ValueError):
+        play_road_building(game)
+
+    assert player.development_cards == ["road_building"]
+    assert player.played_dev_card_this_turn is False
+    assert game.phase == phase
+
+
+def test_free_road_wrong_phase(road_building_setup):
+    game, first_edge, _ = road_building_setup
+
+    with pytest.raises(ValueError):
+        place_free_road(game, first_edge)
+
+    assert game.players[0].roads == set()
+    assert game.phase == "main_turn"
+
+
+from catan.actions import update_longest_road
+
+
+@pytest.mark.parametrize(
+    "lengths, previous_holder, expected_holder",
+    [
+        ({0: 4, 1: 3}, None, None),
+        ({0: 5, 1: 3}, None, 0),
+        ({0: 5, 1: 5}, None, None),
+        ({0: 5, 1: 5}, 0, 0),
+        ({0: 5, 1: 6}, 0, 1),
+        ({0: 4, 1: 3}, 0, None),
+        ({0: 4, 1: 5}, 0, 1),
+    ]
+)
+def test_update_longest_road(
+    game, monkeypatch, lengths, previous_holder, expected_holder
+):
+    monkeypatch.setattr(
+        "catan.actions.longest_road_length",
+        lambda state, player_id: lengths[player_id]
+    )
+
+    game.longest_road_holder = previous_holder
+
+    update_longest_road(game)
+
+    assert game.longest_road_holder == expected_holder
+
+    for player_id in game.players:
+        expected_points = 2 if player_id == expected_holder else 0
+        assert game.visible_victory_points(player_id) == expected_points
+
+# ==========================================
+# Helpers
+# ==========================================
+
+def setup_fourteen_points(game):
+    """Give player 0 exactly 14 victory points."""
+    player = game.players[0]
+    vertices = list(game.board.vertices)
+
+    player.cities.update(vertices[:4])
+    player.settlements.add(vertices[4])
+
+    game.longest_road_holder = 0
+    game.largest_army_holder = 0
+
+    player.development_cards = ["victory_point"]
+
+    assert game.total_victory_points(0) == 14
+
+
+def find_five_road_path(game):
+    """Find five consecutive edges without repeated vertices."""
+
+    def search(vertex, visited, path):
+        if len(path) == 5:
+            return path
+
+        for neighbor in game.board.vertex_adjacency[vertex]:
+            if neighbor in visited:
+                continue
+
+            edge = frozenset({vertex, neighbor})
+
+            result = search(
+                neighbor,
+                visited | {neighbor},
+                path + [edge]
+            )
+
+            if result is not None:
+                return result
+
+        return None
+
+    for vertex in game.board.vertices:
+        result = search(vertex, {vertex}, [])
+
+        if result is not None:
+            return result
+
+    raise AssertionError("No five-road path found")
+
+
+# ==========================================
+# Victory detection
+# ==========================================
+
+def test_victory_threshold(game):
+    game.phase = "main_turn"
+    setup_fourteen_points(game)
+
+    check_victory(game)
+
+    # 14 points is not enough
+    assert game.winner_id is None
+    assert game.phase == "main_turn"
+
+    # Add one hidden victory point
+    game.players[0].new_development_cards.append(
+        "victory_point"
+    )
+
+    assert game.total_victory_points(0) == 15
+
+    check_victory(game)
+
+    assert game.winner_id == 0
+    assert game.phase == "game_over"
+
+
+def test_only_current_player_can_win(game):
+    game.phase = "main_turn"
+    setup_fourteen_points(game)
+
+    game.players[0].development_cards.append(
+        "victory_point"
+    )
+
+    # Player 1 is currently playing
+    game.current_player_id = 1
+
+    check_victory(game)
+
+    assert game.winner_id is None
+    assert game.phase == "main_turn"
+
+
+# ==========================================
+# Victory through development cards
+# ==========================================
+
+def test_victory_by_purchasing_vp_card(game):
+    game.phase = "main_turn"
+    setup_fourteen_points(game)
+
+    player = game.players[0]
+
+    # Force the next card to be a victory point
+    game.development_card_deck = ["victory_point"]
+
+    for resource in ["ore", "wheat", "sheep"]:
+        player.resources[resource] = 1
+        game.bank[resource] -= 1
+
+    buy_development_card(game)
+
+    assert player.new_development_cards == [
+        "victory_point"
+    ]
+    assert game.total_victory_points(0) == 15
+    assert game.winner_id == 0
+    assert game.phase == "game_over"
+
+
+def test_knight_victory_without_robber_move(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    vertices = list(game.board.vertices)
+    player.cities.update(vertices[:4])
+    player.settlements.add(vertices[4])
+
+    # 9 building + 2 longest road + 2 hidden = 13
+    game.longest_road_holder = 0
+    player.development_cards = [
+        "knight", "victory_point", "victory_point"
+    ]
+    player.knights_played = 2
+
+    assert game.total_victory_points(0) == 13
+
+    original_robber_hex = game.robber_hex
+
+    # Third Knight awards Largest Army (+2 VP)
+    play_knight(game)
+
+    assert player.knights_played == 3
+    assert game.largest_army_holder == 0
+    assert game.total_victory_points(0) == 15
+
+    assert game.winner_id == 0
+    assert game.phase == "game_over"
+
+    # Game ends before robber movement
+    assert game.robber_hex == original_robber_hex
+    assert game.robber_return_phase is None
+
+
+# ==========================================
+# Victory through construction
+# ==========================================
+
+def test_victory_by_building_city(game):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    vertices = list(game.board.vertices)
+
+    player.cities.update(vertices[:3])
+    player.settlements.update(vertices[3:5])
+
+    game.longest_road_holder = 0
+    game.largest_army_holder = 0
+    player.development_cards = [
+        "victory_point", "victory_point"
+    ]
+
+    # 8 building + 4 awards + 2 hidden = 14
+    assert game.total_victory_points(0) == 14
+
+    player.resources["ore"] = 3
+    player.resources["wheat"] = 2
+    game.bank["ore"] -= 3
+    game.bank["wheat"] -= 2
+
+    build_city(game, vertices[3])
+
+    assert game.total_victory_points(0) == 15
+    assert game.winner_id == 0
+    assert game.phase == "game_over"
+
+
+@pytest.mark.parametrize("free_road", [False, True])
+def test_victory_by_longest_road(game, free_road):
+    game.phase = "main_turn"
+    player = game.players[0]
+
+    vertices = list(game.board.vertices)
+    player.cities.update(vertices[:4])
+    player.settlements.add(vertices[4])
+
+    game.largest_army_holder = 0
+    player.development_cards = [
+        "victory_point", "victory_point"
+    ]
+
+    # 9 building + 2 largest army + 2 hidden = 13
+    assert game.total_victory_points(0) == 13
+
+    path = find_five_road_path(game)
+
+    # Player already owns four consecutive roads
+    player.roads.update(path[:4])
+
+    assert longest_road_length(game, 0) == 4
+    assert can_place_road(game, path[4], 0)
+
+    if free_road:
+        player.development_cards.append("road_building")
+
+        play_road_building(game)
+        place_free_road(game, path[4])
+
+        # Temporary phase must be cleaned up
+        assert game.free_roads_remaining == 0
+        assert game.road_building_return_phase is None
+
+    else:
+        player.resources["wood"] = 1
+        player.resources["brick"] = 1
+        game.bank["wood"] -= 1
+        game.bank["brick"] -= 1
+
+        build_road(game, path[4])
+
+    assert longest_road_length(game, 0) == 5
+    assert game.longest_road_holder == 0
+    assert game.total_victory_points(0) == 15
+
+    assert game.winner_id == 0
+    assert game.phase == "game_over"
+
+
+# ==========================================
+# Overall integration: setup and turns
+# ==========================================
+
+def test_complete_setup_and_two_turns(game, monkeypatch):
+    # Complete the A-B-B-A initial setup
+    for player_id in SETUP_ORDER:
+        assert game.current_player_id == player_id
+
+        vertex = next(
+            v for v in game.board.vertices
+            if can_place_initial_settlement(game, v)
+        )
+        place_initial_settlement(game, vertex)
+
+        edge = next(
+            e for e in game.board.edges
+            if can_place_initial_road(game, e)
+        )
+        place_initial_road(game, edge)
+
+    assert game.phase == "roll_dice"
+    assert game.current_player_id == 0
+
+    for player in game.players.values():
+        assert len(player.settlements) == 2
+        assert len(player.roads) == 2
+
+    # Force rolls of 3 and 6
+    dice = iter([1, 2, 3, 3])
+    monkeypatch.setattr(
+        game.rng, "randint",
+        lambda a, b: next(dice)
+    )
+
+    # Player 0's turn
+    assert roll_dice(game) == 3
+    assert game.phase == "main_turn"
+
+    end_turn(game)
+
+    assert game.current_player_id == 1
+    assert game.phase == "roll_dice"
+
+    # Player 1's turn
+    assert roll_dice(game) == 6
+    assert game.phase == "main_turn"
+
+    end_turn(game)
+
+    assert game.current_player_id == 0
+    assert game.turn_number == 2
+    assert game.phase == "roll_dice"
+
+    # Resources must be conserved
+    for resource in game.bank:
+        total = game.bank[resource] + sum(
+            player.resources[resource]
+            for player in game.players.values()
+        )
+        assert total == 19
+
+    assert game.winner_id is None
 
