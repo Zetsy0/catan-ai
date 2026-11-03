@@ -1,0 +1,9 @@
+Metadata-Version: 2.4
+Name: catan-ai
+Version: 0.1.0
+Requires-Python: >=3.11
+Provides-Extra: visualization
+Requires-Dist: matplotlib; extra == "visualization"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: matplotlib; extra == "dev"

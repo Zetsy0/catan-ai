@@ -1,0 +1,7 @@
+
+[dev]
+pytest
+matplotlib
+
+[visualization]
+matplotlib
